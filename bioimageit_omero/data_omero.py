@@ -22,6 +22,7 @@ from skimage.io import imread, imsave
 from omero.gateway import BlitzGateway, DatasetWrapper, ProjectWrapper
 import omero
 
+from omero.cli import cli_login
 from bioimageit_formats import FormatsAccess, formatsServices
 
 from bioimageit_core.core.config import ConfigAccess
@@ -39,8 +40,161 @@ from bioimageit_core.containers.data_containers import (METADATA_TYPE_RAW,
                                                         RunParameterContainer,
                                                         DatasetInfo,
                                                         )
+import argparse
+import locale
+import os
+import platform
+import sys
+
+import omero.clients
+from omero.cli import cli_login
+from omero.model import ChecksumAlgorithmI
+from omero.model import NamedValue
+from omero.model.enums import ChecksumAlgorithmSHA1160
+from omero.rtypes import rstring, rbool
+from omero_version import omero_version
+from omero.callbacks import CmdCallbackI
+
+##################### Test ######################
+
+def get_files_for_fileset(fs_path):
+    if os.path.isfile(fs_path):
+        files = [fs_path]
+    else:
+        files = [os.path.join(fs_path, f)
+                 for f in os.listdir(fs_path) if not f.startswith('.')]
+    return files
 
 
+def create_fileset(files):
+    """Create a new Fileset from local files."""
+    fileset = omero.model.FilesetI()
+    for f in files:
+        entry = omero.model.FilesetEntryI()
+        entry.setClientPath(rstring(f))
+        fileset.addFilesetEntry(entry)
+
+    # Fill version info
+    system, node, release, version, machine, processor = platform.uname()
+
+    client_version_info = [
+        NamedValue('omero.version', omero_version),
+        NamedValue('os.name', system),
+        NamedValue('os.version', release),
+        NamedValue('os.architecture', machine)
+    ]
+    try:
+        client_version_info.append(
+            NamedValue('locale', locale.getdefaultlocale()[0]))
+    except:
+        pass
+
+    upload = omero.model.UploadJobI()
+    upload.setVersionInfo(client_version_info)
+    fileset.linkJob(upload)
+    return fileset
+
+def create_settings():
+    """Create ImportSettings and set some values."""
+    settings = omero.grid.ImportSettings()
+    settings.doThumbnails = rbool(True)
+    settings.noStatsInfo = rbool(False)
+    settings.userSpecifiedTarget = None
+    settings.userSpecifiedName = None
+    settings.userSpecifiedDescription = None
+    settings.userSpecifiedAnnotationList = None
+    settings.userSpecifiedPixels = None
+    settings.checksumAlgorithm = ChecksumAlgorithmI()
+    s = rstring(ChecksumAlgorithmSHA1160)
+    settings.checksumAlgorithm.value = s
+    return settings
+
+
+def upload_files(proc, files, client):
+    """Upload files to OMERO from local filesystem."""
+    ret_val = []
+    for i, fobj in enumerate(files):
+        rfs = proc.getUploader(i)
+        try:
+            with open(fobj, 'rb') as f:
+                print ('Uploading: %s' % fobj)
+                offset = 0
+                block = []
+                rfs.write(block, offset, len(block))  # Touch
+                while True:
+                    block = f.read(1000 * 1000)
+                    if not block:
+                        break
+                    rfs.write(block, offset, len(block))
+                    offset += len(block)
+                ret_val.append(client.sha1(fobj))
+        finally:
+            rfs.close()
+    return ret_val
+
+
+def assert_import(client, proc, files, wait):
+    """Wait and check that we imported an image."""
+    hashes = upload_files(proc, files, client)
+    print ('Hashes:\n  %s' % '\n  '.join(hashes))
+    handle = proc.verifyUpload(hashes)
+    cb = CmdCallbackI(client, handle)
+
+    # https://github.com/openmicroscopy/openmicroscopy/blob/v5.4.9/components/blitz/src/ome/formats/importer/ImportLibrary.java#L631
+    if wait == 0:
+        cb.close(False)
+        return None
+    if wait < 0:
+        while not cb.block(2000):
+            sys.stdout.write('.')
+            sys.stdout.flush()
+        sys.stdout.write('\n')
+    else:
+        cb.loop(wait, 1000)
+    rsp = cb.getResponse()
+    if isinstance(rsp, omero.cmd.ERR):
+        raise Exception(rsp)
+    assert len(rsp.pixels) > 0
+    return rsp
+
+
+def full_import(client, fs_path, wait=-1):
+    """Re-usable method for a basic import."""
+    mrepo = client.getManagedRepository()
+    files = get_files_for_fileset(fs_path)
+    assert files, 'No files found: %s' % fs_path
+
+    fileset = create_fileset(files)
+    settings = create_settings()
+
+    proc = mrepo.importFileset(fileset, settings)
+    try:
+        return assert_import(client, proc, files, wait)
+    finally:
+        proc.close()
+
+def main_import(data_path, host, port, username, password):
+    client=omero.client(host,port)
+    session=client.createSession(username,password)
+    conn = BlitzGateway(client_obj=client)
+
+    print ('Importing: %s' % data_path)
+    rsp = full_import(client, data_path)
+    if rsp:
+        links = []
+        for p in rsp.pixels:
+            print ('Imported Image ID: %d' % p.image.id.val)
+            # if args.dataset:
+            #     link = omero.model.DatasetImageLinkI()
+            #     link.parent = omero.model.DatasetI(args.dataset, False)
+            #     link.child = omero.model.ImageI(p.image.id.val, False)
+            #     links.append(link)
+        conn.getUpdateService().saveArray(links, conn.SERVICE_OPTS)
+    
+    return p.image.id.val
+
+
+#################################################
 
 plugin_info = {
     'name': 'OMERO',
@@ -340,7 +494,7 @@ class OmeroMetadataService:
             pass
 
     def import_data(self, experiment, data_path, name, author, format_,
-                    date='now', key_value_pairs=dict):
+                    date='now', key_value_pairs=dict()):
         """import one data to the experiment
 
         The data is imported to the raw dataset
@@ -376,22 +530,30 @@ class OmeroMetadataService:
             # copy the image to omero
             image_id = 0
             if format_ == 'imagetiff':
-                image_id = self._omero_write_tiff_image(data_path, name, dataset)
+                image_id = main_import(data_path, self._host,self._port,self._username,self._password)
+                link = omero.model.DatasetImageLinkI()
+                link.setParent(omero.model.DatasetI(raw_dataset_id, False))
+                link.setChild(omero.model.ImageI(image_id, False))
+                self._conn.getUpdateService().saveObject(link)
+
             else:
                 raise DataServiceError(f'OMERO service can only import tiff images (format={format_})')  
 
             # add key value pairs
             keys_value_list = []
-            for key, value in key_value_pairs.items():
-                keys_value_list.append([key, value])
-            if len(keys_value_list) > 0:
-                map_ann = omero.gateway.MapAnnotationWrapper(self._conn)
-                namespace = omero.constants.metadata.NSCLIENTMAPANNOTATION
-                map_ann.setNs(namespace)
-                map_ann.setValue(keys_value_list)
-                map_ann.save()
-                image = self._conn.getObject("Image", image_id)
-                image.linkAnnotation(map_ann)      
+            print(type(key_value_pairs))
+            print(key_value_pairs)
+            if len(key_value_pairs)!=0:
+                for key, value in key_value_pairs.items():
+                    keys_value_list.append([key, value])
+                if len(keys_value_list) > 0:
+                    map_ann = omero.gateway.MapAnnotationWrapper(self._conn)
+                    namespace = omero.constants.metadata.NSCLIENTMAPANNOTATION
+                    map_ann.setNs(namespace)
+                    map_ann.setValue(keys_value_list)
+                    map_ann.save()
+                    image = self._conn.getObject("Image", image_id)
+                    image.linkAnnotation(map_ann)      
         finally:
             #self._omero_close()
             pass    
