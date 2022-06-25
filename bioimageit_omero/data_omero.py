@@ -54,6 +54,21 @@ from omero.model.enums import ChecksumAlgorithmSHA1160
 from omero.rtypes import rstring, rbool
 from omero_version import omero_version
 from omero.callbacks import CmdCallbackI
+from omero.model import enums as omero_enums
+import dask.array as da
+from dask import delayed
+
+
+PIXEL_TYPES = {
+    omero_enums.PixelsTypeint8: np.int8,
+    omero_enums.PixelsTypeuint8: np.uint8,
+    omero_enums.PixelsTypeint16: np.int16,
+    omero_enums.PixelsTypeuint16: np.uint16,
+    omero_enums.PixelsTypeint32: np.int32,
+    omero_enums.PixelsTypeuint32: np.uint32,
+    omero_enums.PixelsTypefloat: np.float32,
+    omero_enums.PixelsTypedouble: np.float64,
+}
 
 ##################### Test ######################
 
@@ -1238,3 +1253,31 @@ class OmeroMetadataService:
                                               description='',
                                               dataset=parent_dataset) 
         return i                                      
+
+    def view_data(self, md_uri):
+        raw_data = self.get_raw_data(md_uri)
+        if raw_data.format == 'imagetiff':
+            return self._omero_image_lazy_loading(md_uri)
+        return None  
+
+    def _omero_image_lazy_loading(self, image_id):
+
+        image = self._conn.getObject("Image", image_id)
+        nt, nc, nz, ny, nx = [getattr(image, f'getSize{x}')() for x in 'TCZYX']
+        pixels = image.getPrimaryPixels()
+        dtype = PIXEL_TYPES.get(pixels.getPixelsType().value, None)
+        get_plane = delayed(lambda idx: pixels.getPlane(*idx))
+
+        def get_lazy_plane(zct):
+            return da.from_delayed(get_plane(zct), shape=(ny, nx), dtype=dtype)
+
+        da_image_list = []
+        for c in range(nc):
+            t_stacks = []
+            for t in range(nt):
+                z_stack = []
+                for z in range(nz):
+                    z_stack.append(get_lazy_plane((z, c, t)))
+                t_stacks.append(da.stack(z_stack))
+            da_image_list.append(da.stack(t_stacks))
+        return da_image_list    
