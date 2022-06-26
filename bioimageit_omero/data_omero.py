@@ -544,7 +544,7 @@ class OmeroMetadataService:
 
             # copy the image to omero
             image_id = 0
-            if format_ == 'imagetiff':
+            if format_ == 'imagetiff' or format_ == 'bioformat':
                 image_id = main_import(data_path, self._host,self._port,self._username,self._password)
                 link = omero.model.DatasetImageLinkI()
                 link.setParent(omero.model.DatasetI(raw_dataset_id, False))
