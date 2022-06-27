@@ -70,7 +70,7 @@ PIXEL_TYPES = {
     omero_enums.PixelsTypedouble: np.float64,
 }
 
-##################### Test ######################
+##################### UPLOAD TO OMERO ######################
 
 def get_files_for_fileset(fs_path):
     if os.path.isfile(fs_path):
@@ -209,7 +209,7 @@ def main_import(data_path, host, port, username, password):
     return p.image.id.val
 
 
-#################################################
+############################################################
 
 plugin_info = {
     'name': 'OMERO',
